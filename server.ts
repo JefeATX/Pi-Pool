@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import { execSync, spawn, ChildProcess } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { DEFAULT_POOL_CONFIGS } from "./src/data/coins.js";
@@ -17,6 +18,7 @@ let poolsConfig: Record<string, any> = { ...DEFAULT_POOL_CONFIGS };
 let isMinerRunning = false;
 let minerStartTime = 0;
 let systemUptimeStart = Date.now();
+let activeChildProcesses: Record<string, ChildProcess> = {};
 let logs: Array<{
   id: string;
   timestamp: string;
@@ -45,22 +47,48 @@ function saveConfigToDisk() {
   }
 }
 
-// Helper to read real CPU temperature from Raspberry Pi kernel sysfs or hwmon
+// Helper to find available miner binary on system
+function findMinerBinary(): string | null {
+  const candidates = ["cpuminer-opt", "cpuminer", "xmrig", "ccminer", "minerd"];
+  for (const bin of candidates) {
+    try {
+      const out = execSync(`which ${bin}`, { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }).trim();
+      if (out && fs.existsSync(out)) return out;
+    } catch (e) {}
+  }
+  // Check local build relative path
+  const localCandidates = ["./cpuminer", "./cpuminer-opt", "./xmrig", "/usr/local/bin/cpuminer", "/usr/bin/cpuminer"];
+  for (const p of localCandidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+// Helper to read real CPU temperature from Raspberry Pi kernel sysfs, vcgencmd, or hwmon
 function getCpuTemperature(isMinerRunning: boolean, activeCoresCount: number): number {
+  // 1. Try vcgencmd measure_temp on Raspberry Pi
+  try {
+    const output = execSync("vcgencmd measure_temp", { encoding: "utf-8", timeout: 800, stdio: ["pipe", "pipe", "ignore"] }).trim();
+    const match = output.match(/temp=([0-9.]+)/);
+    if (match && match[1]) {
+      const val = parseFloat(match[1]);
+      if (!isNaN(val) && val > 0) return val;
+    }
+  } catch (e) {}
+
+  // 2. Try sysfs thermal zone
   try {
     const sysPath = "/sys/class/thermal/thermal_zone0/temp";
     if (fs.existsSync(sysPath)) {
       const raw = fs.readFileSync(sysPath, "utf-8").trim();
       const val = parseInt(raw, 10);
       if (!isNaN(val) && val > 0) {
-        // Temperature is reported in millidegrees Celsius (e.g. 44123 -> 44.1°C)
         return Math.round((val / 1000) * 10) / 10;
       }
     }
-  } catch (e) {
-    // Ignore and attempt fallbacks
-  }
+  } catch (e) {}
 
+  // 3. Try hwmon
   try {
     const hwmonPath = "/sys/class/hwmon/hwmon0/temp1_input";
     if (fs.existsSync(hwmonPath)) {
@@ -70,11 +98,9 @@ function getCpuTemperature(isMinerRunning: boolean, activeCoresCount: number): n
         return Math.round((val / 1000) * 10) / 10;
       }
     }
-  } catch (e) {
-    // Ignore
-  }
+  } catch (e) {}
 
-  // Fallback for non-Pi or simulated environment (realistic ~43-47°C range)
+  // Fallback for non-Pi environment
   const baseTemp = isMinerRunning ? 44.0 + activeCoresCount * 0.7 : 42.0;
   return Math.round((baseTemp + (Math.random() - 0.5) * 0.8) * 10) / 10;
 }
@@ -327,6 +353,123 @@ app.get("/api/miner/status", (req, res) => {
   });
 });
 
+// Native miner process runner
+function stopNativeMinerProcesses() {
+  for (const [key, child] of Object.entries(activeChildProcesses)) {
+    try {
+      if (child && !child.killed) {
+        child.kill("SIGTERM");
+      }
+    } catch (e) {}
+  }
+  activeChildProcesses = {};
+}
+
+function startNativeMinerProcesses() {
+  stopNativeMinerProcesses();
+
+  const minerBin = findMinerBinary();
+  const timestamp = () => new Date().toISOString().replace("T", " ").substring(0, 19);
+
+  if (!minerBin) {
+    logs.unshift({
+      id: Math.random().toString(36).substring(2, 9),
+      timestamp: timestamp(),
+      poolKey: "System",
+      poolName: "Pi-Pool Daemon",
+      type: "system",
+      message: `[NOTICE] cpuminer binary not found in system PATH. To connect real online workers to mining pools on Raspberry Pi OS, install cpuminer-opt ('sudo apt-get update && sudo apt-get install -y cpuminer-opt' or compile cpuminer-multi). Dashboard is active in monitoring mode.`,
+    });
+    return;
+  }
+
+  logs.unshift({
+    id: Math.random().toString(36).substring(2, 9),
+    timestamp: timestamp(),
+    poolKey: "System",
+    poolName: "Pi-Pool Daemon",
+    type: "system",
+    message: `[NATIVE] Spawning native miner processes using '${minerBin}' with taskset core affinity...`,
+  });
+
+  for (const [poolKey, pool] of Object.entries(poolsConfig)) {
+    if (pool.enabled && pool.addr && pool.wallet && Array.isArray(pool.cores) && pool.cores.length > 0) {
+      let stratumUrl = pool.addr;
+      if (!stratumUrl.startsWith("stratum+tcp://") && !stratumUrl.startsWith("stratum+ssl://")) {
+        stratumUrl = `stratum+tcp://${stratumUrl}`;
+      }
+
+      const pass = pool.password || "x";
+      const coreList = pool.cores.join(",");
+      const algo = pool.algo || "verus";
+
+      const args = ["-c", coreList, minerBin, "-a", algo, "-o", stratumUrl, "-u", pool.wallet, "-p", pass];
+
+      try {
+        const child = spawn("taskset", args, { stdio: ["ignore", "pipe", "pipe"] });
+        activeChildProcesses[poolKey] = child;
+
+        const handleLogData = (data: Buffer) => {
+          const lines = data.toString("utf-8").split("\n");
+          for (const line of lines) {
+            const cleanLine = line.trim();
+            if (!cleanLine) continue;
+
+            let logType: "info" | "accepted" | "rejected" | "stratum" | "error" = "info";
+            const lower = cleanLine.toLowerCase();
+            if (lower.includes("accept") || lower.includes("yes!") || lower.includes("share accepted")) {
+              logType = "accepted";
+              if (sharesData[poolKey]) sharesData[poolKey].acc++;
+            } else if (lower.includes("reject") || lower.includes("stale")) {
+              logType = "rejected";
+              if (sharesData[poolKey]) sharesData[poolKey].rej++;
+            } else if (lower.includes("stratum") || lower.includes("submitting")) {
+              logType = "stratum";
+            } else if (lower.includes("error") || lower.includes("failed")) {
+              logType = "error";
+            }
+
+            if (logs.length < 300) {
+              logs.unshift({
+                id: Math.random().toString(36).substring(2, 9),
+                timestamp: timestamp(),
+                poolKey,
+                poolName: pool.name,
+                type: logType,
+                message: `[${pool.name}] ${cleanLine}`,
+              });
+            }
+          }
+        };
+
+        if (child.stdout) child.stdout.on("data", handleLogData);
+        if (child.stderr) child.stderr.on("data", handleLogData);
+
+        child.on("exit", (code) => {
+          logs.unshift({
+            id: Math.random().toString(36).substring(2, 9),
+            timestamp: timestamp(),
+            poolKey,
+            poolName: pool.name,
+            type: "system",
+            message: `[${pool.name}] Process exited with code ${code}`,
+          });
+          delete activeChildProcesses[poolKey];
+        });
+      } catch (err: any) {
+        logs.unshift({
+          id: Math.random().toString(36).substring(2, 9),
+          timestamp: timestamp(),
+          poolKey,
+          poolName: pool.name,
+          type: "error",
+          message: `[${pool.name}] Failed to spawn miner process: ${err.message}`,
+        });
+      }
+    }
+  }
+}
+
 // Miner Start POST
 app.post("/api/miner/start", (req, res) => {
   const enabledPools = Object.entries(poolsConfig).filter(
@@ -358,12 +501,15 @@ app.post("/api/miner/start", (req, res) => {
     message: `MINER STARTED ON ${enabledPools.length} POOL(S) WITH CPU TASKSET AFFINITY`,
   });
 
+  startNativeMinerProcesses();
+
   res.json({ success: true, isMinerRunning: true });
 });
 
 // Miner Stop POST
 app.post("/api/miner/stop", (req, res) => {
   isMinerRunning = false;
+  stopNativeMinerProcesses();
 
   logs.unshift({
     id: Math.random().toString(36).substring(2, 9),
