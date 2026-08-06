@@ -395,7 +395,10 @@ app.get("/api/miner/status", async (req, res) => {
       overallHashrateKhs += poolHash;
     }
 
-    const shares = sharesData[poolKey] || { acc: 0, rej: 0 };
+    if (!sharesData[poolKey]) {
+      sharesData[poolKey] = { acc: 0, rej: 0, lastShare: Date.now() };
+    }
+    const shares = sharesData[poolKey];
     if (summaryObj) {
       if (summaryObj.ACC) {
         const parsedAcc = parseInt(summaryObj.ACC, 10);
@@ -589,10 +592,10 @@ function startNativeMinerProcesses() {
               }
             }
 
-            const isAcceptedLine = /accepted:\s*\d+|share accepted|\(yay!\)/i.test(cleanLine);
-            const isRejectedLine = /share rejected|\(boooo\)|reject:\s*\d+/i.test(cleanLine);
+            const isAcceptedLine = /\baccept(ed)?\b|\(yay!\)|yay!/i.test(cleanLine);
+            const isRejectedLine = /\breject(ed)?\b|\(boooo\)|stale/i.test(cleanLine);
 
-            if (isAcceptedLine) {
+            if (isAcceptedLine && !isRejectedLine) {
               logType = "accepted";
               if (sharesData[poolKey]) sharesData[poolKey].acc++;
             } else if (isRejectedLine) {
