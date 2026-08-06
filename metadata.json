@@ -1,0 +1,6 @@
+{
+  "name": "Pi-Pool Mining Dashboard",
+  "description": "Raspberry Pi & CPU Miner GUI for monitoring cpuminer-multi pools, hash rates, core CPU assignments, hardware thermal stats, and estimated crypto earnings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

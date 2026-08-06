@@ -1,0 +1,98 @@
+{
+  "Pool 1": {
+    "name": "Pool 1",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": true,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 2": {
+    "name": "Pool 2",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": true,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 3": {
+    "name": "Pool 3",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 4": {
+    "name": "Pool 4",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 5": {
+    "name": "Pool 5",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 6": {
+    "name": "Pool 6",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 7": {
+    "name": "Pool 7",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  },
+  "Pool 8": {
+    "name": "Pool 8",
+    "addr": "",
+    "port": "",
+    "worker": "",
+    "pass": "x",
+    "wallet": "",
+    "enabled": false,
+    "log_enabled": false,
+    "cores": [],
+    "algo": "scrypt"
+  }
+}
