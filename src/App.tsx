@@ -39,25 +39,32 @@ export default function App() {
 
   // Poll live status every 2 seconds
   useEffect(() => {
-    const pollStatus = () => {
-      fetch('/api/miner/status')
-        .then((res) => res.json())
-        .then((data) => {
-          setIsMinerRunning(data.isMinerRunning);
-          setSystemStats(data.systemStats);
-          setPoolLiveStatsMap(data.poolStatsMap || {});
-          setCoreUsages(data.coreUsages || []);
-          setHistoricalData(data.historicalData || []);
-          if (Array.isArray(data.recentLogs)) {
-            setLogs(data.recentLogs);
-          }
-        })
-        .catch((e) => console.error('Error polling status:', e));
+    let isMounted = true;
+    const pollStatus = async () => {
+      try {
+        const res = await fetch('/api/miner/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!isMounted) return;
+        setIsMinerRunning(!!data.isMinerRunning);
+        if (data.systemStats) setSystemStats(data.systemStats);
+        setPoolLiveStatsMap(data.poolStatsMap || {});
+        setCoreUsages(data.coreUsages || []);
+        setHistoricalData(data.historicalData || []);
+        if (Array.isArray(data.recentLogs)) {
+          setLogs(data.recentLogs);
+        }
+      } catch (e) {
+        // Ignore temporary network disconnects or dev server restarts
+      }
     };
 
     pollStatus();
     const interval = setInterval(pollStatus, 2000);
-    return () => clearInterval(interval);
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
   }, []);
 
   const handleToggleMiner = async () => {
