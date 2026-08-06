@@ -49,7 +49,7 @@ function saveConfigToDisk() {
 
 // Helper to find available miner binary on system
 function findMinerBinary(): string | null {
-  const candidates = ["cpuminer-opt", "cpuminer", "xmrig", "ccminer", "minerd"];
+  const candidates = ["cpuminer-multi", "cpuminer-opt", "cpuminer", "xmrig", "ccminer", "minerd"];
   for (const bin of candidates) {
     try {
       const out = execSync(`which ${bin}`, { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }).trim();
@@ -57,7 +57,18 @@ function findMinerBinary(): string | null {
     } catch (e) {}
   }
   // Check local build relative path
-  const localCandidates = ["./cpuminer", "./cpuminer-opt", "./xmrig", "/usr/local/bin/cpuminer", "/usr/bin/cpuminer"];
+  const localCandidates = [
+    "./cpuminer-multi",
+    "./cpuminer",
+    "./cpuminer-opt",
+    "./xmrig",
+    "/usr/local/bin/cpuminer-multi",
+    "/usr/bin/cpuminer-multi",
+    "/usr/local/bin/cpuminer",
+    "/usr/bin/cpuminer",
+    "/usr/local/bin/cpuminer-opt",
+    "/usr/bin/cpuminer-opt",
+  ];
   for (const p of localCandidates) {
     if (fs.existsSync(p)) return p;
   }
@@ -378,7 +389,7 @@ function startNativeMinerProcesses() {
       poolKey: "System",
       poolName: "Pi-Pool Daemon",
       type: "system",
-      message: `[NOTICE] cpuminer binary not found in system PATH. To connect real online workers to mining pools on Raspberry Pi OS, install cpuminer-opt ('sudo apt-get update && sudo apt-get install -y cpuminer-opt' or compile cpuminer-multi). Dashboard is active in monitoring mode.`,
+      message: `[NOTICE] cpuminer binary not found in system PATH. Ensure cpuminer-multi (or cpuminer-opt) is installed ('sudo apt-get install -y cpuminer-multi' or compiled in /usr/local/bin). Dashboard is active in monitoring mode.`,
     });
     return;
   }
@@ -389,21 +400,44 @@ function startNativeMinerProcesses() {
     poolKey: "System",
     poolName: "Pi-Pool Daemon",
     type: "system",
-    message: `[NATIVE] Spawning native miner processes using '${minerBin}' with taskset core affinity...`,
+    message: `[NATIVE] Spawning cpuminer process '${minerBin}' with taskset CPU affinity...`,
   });
 
   for (const [poolKey, pool] of Object.entries(poolsConfig)) {
     if (pool.enabled && pool.addr && pool.wallet && Array.isArray(pool.cores) && pool.cores.length > 0) {
-      let stratumUrl = pool.addr;
-      if (!stratumUrl.startsWith("stratum+tcp://") && !stratumUrl.startsWith("stratum+ssl://")) {
+      // Stratum URL & Port formatting
+      let stratumUrl = pool.addr.trim();
+      if (pool.port && pool.port.trim() && !stratumUrl.includes(`:${pool.port.trim()}`)) {
+        stratumUrl = `${stratumUrl}:${pool.port.trim()}`;
+      }
+      if (!stratumUrl.startsWith("stratum+tcp://") && !stratumUrl.startsWith("stratum+ssl://") && !stratumUrl.startsWith("tcp://")) {
         stratumUrl = `stratum+tcp://${stratumUrl}`;
       }
 
-      const pass = pool.password || "x";
-      const coreList = pool.cores.join(",");
-      const algo = pool.algo || "verus";
+      // Worker name formatting (WALLET.WORKER) for online pool dashboard recognition
+      let userArg = pool.wallet.trim();
+      if (pool.worker && pool.worker.trim()) {
+        const workerClean = pool.worker.trim();
+        if (!userArg.endsWith(`.${workerClean}`) && !userArg.endsWith(`/${workerClean}`)) {
+          userArg = `${userArg}.${workerClean}`;
+        }
+      }
 
-      const args = ["-c", coreList, minerBin, "-a", algo, "-o", stratumUrl, "-u", pool.wallet, "-p", pass];
+      const pass = pool.password || pool.pass || "x";
+      const threadCount = pool.cores.length;
+      const coreList = pool.cores.join(",");
+      const algo = pool.algo || "scrypt";
+
+      // Build taskset execution args
+      const args = [
+        "-c", coreList,
+        minerBin,
+        "-a", algo,
+        "-o", stratumUrl,
+        "-u", userArg,
+        "-p", pass,
+        "-t", threadCount.toString()
+      ];
 
       try {
         const child = spawn("taskset", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -417,15 +451,15 @@ function startNativeMinerProcesses() {
 
             let logType: "info" | "accepted" | "rejected" | "stratum" | "error" = "info";
             const lower = cleanLine.toLowerCase();
-            if (lower.includes("accept") || lower.includes("yes!") || lower.includes("share accepted")) {
+            if (lower.includes("accept") || lower.includes("yes!") || lower.includes("share accepted") || lower.includes("yay!")) {
               logType = "accepted";
               if (sharesData[poolKey]) sharesData[poolKey].acc++;
-            } else if (lower.includes("reject") || lower.includes("stale")) {
+            } else if (lower.includes("reject") || lower.includes("stale") || lower.includes("boooo")) {
               logType = "rejected";
               if (sharesData[poolKey]) sharesData[poolKey].rej++;
-            } else if (lower.includes("stratum") || lower.includes("submitting")) {
+            } else if (lower.includes("stratum") || lower.includes("submitting") || lower.includes("difficulty")) {
               logType = "stratum";
-            } else if (lower.includes("error") || lower.includes("failed")) {
+            } else if (lower.includes("error") || lower.includes("failed") || lower.includes("unknown algorithm")) {
               logType = "error";
             }
 
