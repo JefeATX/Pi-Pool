@@ -45,6 +45,40 @@ function saveConfigToDisk() {
   }
 }
 
+// Helper to read real CPU temperature from Raspberry Pi kernel sysfs or hwmon
+function getCpuTemperature(isMinerRunning: boolean, activeCoresCount: number): number {
+  try {
+    const sysPath = "/sys/class/thermal/thermal_zone0/temp";
+    if (fs.existsSync(sysPath)) {
+      const raw = fs.readFileSync(sysPath, "utf-8").trim();
+      const val = parseInt(raw, 10);
+      if (!isNaN(val) && val > 0) {
+        // Temperature is reported in millidegrees Celsius (e.g. 44123 -> 44.1°C)
+        return Math.round((val / 1000) * 10) / 10;
+      }
+    }
+  } catch (e) {
+    // Ignore and attempt fallbacks
+  }
+
+  try {
+    const hwmonPath = "/sys/class/hwmon/hwmon0/temp1_input";
+    if (fs.existsSync(hwmonPath)) {
+      const raw = fs.readFileSync(hwmonPath, "utf-8").trim();
+      const val = parseInt(raw, 10);
+      if (!isNaN(val) && val > 0) {
+        return Math.round((val / 1000) * 10) / 10;
+      }
+    }
+  } catch (e) {
+    // Ignore
+  }
+
+  // Fallback for non-Pi or simulated environment (realistic ~43-47°C range)
+  const baseTemp = isMinerRunning ? 44.0 + activeCoresCount * 0.7 : 42.0;
+  return Math.round((baseTemp + (Math.random() - 0.5) * 0.8) * 10) / 10;
+}
+
 // Live simulation state variables
 let sharesData: Record<string, { acc: number; rej: number; lastShare: number }> = {};
 let historicalDataPoints: Array<{ time: string; totalKhs: number; cpuTempC: number }> = [];
@@ -112,16 +146,12 @@ setInterval(() => {
     }
   }
 
-  // Calculate temperature simulation
-  let baseTemp = 42.0;
-  if (isMinerRunning) {
-    let activeCores = 0;
-    for (const pool of Object.values(poolsConfig)) {
-      if (pool.enabled && pool.cores) activeCores += pool.cores.length;
-    }
-    baseTemp += activeCores * 6.5 + (Math.random() - 0.5) * 1.5;
+  // Calculate real or simulated CPU temperature
+  let activeCores = 0;
+  for (const pool of Object.values(poolsConfig)) {
+    if (pool.enabled && pool.cores) activeCores += pool.cores.length;
   }
-  const currentTemp = Math.round(baseTemp * 10) / 10;
+  const currentTemp = getCpuTemperature(isMinerRunning, activeCores);
 
   // Keep last 30 historical data points
   historicalDataPoints.push({
@@ -259,9 +289,7 @@ app.get("/api/miner/status", (req, res) => {
   for (const pool of Object.values(poolsConfig)) {
     if (pool.enabled && pool.cores) activeCoresCount += pool.cores.length;
   }
-  const tempC = isMinerRunning
-    ? Math.round((42 + activeCoresCount * 6.5 + (Math.random() - 0.5)) * 10) / 10
-    : 41.5;
+  const tempC = getCpuTemperature(isMinerRunning, activeCoresCount);
 
   // Per-core usages
   const coreUsages = [0, 1, 2, 3].map((cid) => {
