@@ -277,21 +277,46 @@ export const PoolSettings: React.FC<PoolSettingsProps> = ({
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="block text-[#555] font-semibold uppercase text-[10px] tracking-widest">
+                Supported Miner Software:
+              </label>
+              <span className="text-[10px] font-mono text-[#00FF41] bg-[#00FF41]/10 px-1.5 py-0.5 rounded-sm border border-[#00FF41]/30">
+                Direct Native API
+              </span>
+            </div>
+            <select
+              value={
+                currentPool.minerProgram ||
+                (currentPool.algo === 'randomx' || currentPool.algo === 'ghostrider'
+                  ? 'xmrig'
+                  : currentPool.algo === 'duco-s1' || currentPool.algo === 'duco-avr'
+                  ? 'duino-coin'
+                  : 'cpuminer-multi')
+              }
+              onChange={(e) => handleFieldChange(activeTab, 'minerProgram', e.target.value)}
+              className="w-full bg-[#080808] border border-[#1a1a1a] rounded-sm px-3.5 py-2.5 text-[#e0e0e0] focus:outline-none focus:border-[#00FF41] transition-colors font-medium text-sm"
+            >
+              <option value="cpuminer-multi">cpuminer-multi (SHA256d / Scrypt / Yescrypt)</option>
+              <option value="duino-coin">Duino-Coin Miner (DUCO-S1 / AVR Serial)</option>
+              <option value="xmrig">XMRig (RandomX / Monero / GhostRider)</option>
+            </select>
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block text-[#555] font-semibold uppercase text-[10px] tracking-widest">
                 Algorithm (-a):
               </label>
-              {MINER_ALGORITHMS.find((a) => a.id === (currentPool.algo || 'scrypt'))?.cpuminerMulti ? (
-                <span className="text-[10px] font-mono text-[#00FF41] bg-[#00FF41]/10 px-1.5 py-0.5 rounded-sm border border-[#00FF41]/30">
-                  ✓ cpuminer-multi Native
-                </span>
-              ) : (
-                <span className="text-[10px] font-mono text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded-sm border border-amber-500/30">
-                  ⚠ Needs specialized binary fork
-                </span>
-              )}
             </div>
             <select
               value={currentPool.algo || 'scrypt'}
-              onChange={(e) => handleFieldChange(activeTab, 'algo', e.target.value)}
+              onChange={(e) => {
+                const newAlgo = e.target.value;
+                handleFieldChange(activeTab, 'algo', newAlgo);
+                const matchAlgo = MINER_ALGORITHMS.find((a) => a.id === newAlgo);
+                if (matchAlgo) {
+                  handleFieldChange(activeTab, 'minerProgram', matchAlgo.minerProgram);
+                }
+              }}
               className="w-full bg-[#080808] border border-[#1a1a1a] rounded-sm px-3.5 py-2.5 text-[#e0e0e0] focus:outline-none focus:border-[#00FF41] transition-colors font-medium text-sm"
             >
               {MINER_ALGORITHMS.map((algo) => (

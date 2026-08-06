@@ -8,7 +8,8 @@ export interface PoolConfig {
   enabled: boolean;
   log_enabled: boolean;
   cores: number[]; // Assigned CPU cores e.g. [0, 1]
-  algo?: string;   // e.g. "sha256d", "verus", "randomx", "yescrypt"
+  algo?: string;   // e.g. "sha256d", "verus", "randomx", "duco-s1"
+  minerProgram?: 'cpuminer-multi' | 'duino-coin' | 'xmrig';
 }
 
 export type PoolsConfigMap = Record<string, PoolConfig>;

@@ -68,6 +68,147 @@ function parseApiKvPayload(rawPayload: string | null): Record<string, string> {
   return parsed;
 }
 
+// XMRig HTTP REST API Query (/1/summary)
+async function queryXmrigApi(apiPort: number): Promise<{
+  hashrateKhs: number;
+  accepted: number;
+  rejected: number;
+  accmn: string;
+  diff: string;
+  uptime: number;
+  responding: boolean;
+} | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 400);
+    const res = await fetch(`http://127.0.0.1:${apiPort}/1/summary`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const sharesGood = data.results?.shares_good ?? 0;
+    const sharesTotal = data.results?.shares_total ?? sharesGood;
+    const sharesRejected = Math.max(0, sharesTotal - sharesGood);
+    const hashrateHs = data.hashrate?.total?.[0] ?? 0;
+    const diffCurrent = data.results?.diff_current ? data.results.diff_current.toLocaleString() : "-";
+    const uptimeSec = data.uptime ?? 0;
+    const minsRun = Math.max(1, uptimeSec / 60);
+    const accmn = (sharesGood / minsRun).toFixed(2);
+
+    return {
+      hashrateKhs: Math.round((hashrateHs / 1000) * 100) / 100,
+      accepted: sharesGood,
+      rejected: sharesRejected,
+      accmn,
+      diff: String(diffCurrent),
+      uptime: uptimeSec,
+      responding: true,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+// Duino-Coin PC & AVR Miner API Query (Socket/HTTP)
+async function queryDuinoCoinApi(apiPort: number): Promise<{
+  hashrateKhs: number;
+  accepted: number;
+  rejected: number;
+  accmn: string;
+  diff: string;
+  uptime: number;
+  responding: boolean;
+} | null> {
+  // Try HTTP endpoint first
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 400);
+    const res = await fetch(`http://127.0.0.1:${apiPort}/stats`, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    if (res.ok) {
+      const data = await res.json();
+      const acc = data.shares?.accepted ?? data.accepted ?? 0;
+      const rej = data.shares?.rejected ?? data.rejected ?? 0;
+      const rawHash = data.hashrate?.khs ?? (data.hashrate?.total ? data.hashrate.total / 1000 : (data.hashrate ? data.hashrate / 1000 : 0));
+      const uptimeSec = data.uptime ?? 0;
+      const minsRun = Math.max(1, uptimeSec / 60);
+      return {
+        hashrateKhs: Math.round(rawHash * 100) / 100,
+        accepted: acc,
+        rejected: rej,
+        accmn: (acc / minsRun).toFixed(2),
+        diff: String(data.difficulty ?? "1500"),
+        uptime: uptimeSec,
+        responding: true,
+      };
+    }
+  } catch (e) {}
+
+  // Fallback to socket query
+  const rawKv = await queryCpuminerApi(apiPort, "summary");
+  if (!rawKv) return null;
+  const parsed = parseApiKvPayload(rawKv);
+  const acc = parseInt(parsed.ACC || "0", 10) || 0;
+  const rej = parseInt(parsed.REJ || "0", 10) || 0;
+  const khs = parseFloat(parsed.KHS || "0") || 0;
+  const uptimeSec = parseInt(parsed.UPTIME || "0", 10) || 0;
+  const minsRun = Math.max(1, uptimeSec / 60);
+
+  return {
+    hashrateKhs: khs,
+    accepted: acc,
+    rejected: rej,
+    accmn: parsed.ACCMN || (acc / minsRun).toFixed(2),
+    diff: parsed.DIFF || "1500",
+    uptime: uptimeSec,
+    responding: true,
+  };
+}
+
+// Unified API Query Dispatcher for Supported Miners
+async function queryMinerApiForPool(poolKey: string, pool: any): Promise<{
+  hashrateKhs: number;
+  accepted: number;
+  rejected: number;
+  accmn: string;
+  diff: string;
+  uptime: number;
+  responding: boolean;
+} | null> {
+  const apiPort = getPoolApiPort(poolKey);
+  const prog = pool.minerProgram || (pool.algo === 'randomx' || pool.algo === 'ghostrider' ? 'xmrig' : pool.algo === 'duco-s1' || pool.algo === 'duco-avr' ? 'duino-coin' : 'cpuminer-multi');
+
+  if (prog === 'xmrig') {
+    return await queryXmrigApi(apiPort);
+  }
+  if (prog === 'duino-coin') {
+    return await queryDuinoCoinApi(apiPort);
+  }
+
+  // Default: cpuminer-multi
+  const rawSum = await queryCpuminerApi(apiPort, "summary");
+  if (!rawSum) return null;
+
+  const parsed = parseApiKvPayload(rawSum);
+  const acc = parseInt(parsed.ACC || "0", 10) || 0;
+  const rej = parseInt(parsed.REJ || "0", 10) || 0;
+  const khs = parseFloat(parsed.KHS || "0") || 0;
+  const uptimeSec = parseInt(parsed.UPTIME || "0", 10) || 0;
+  const minsRun = Math.max(1, uptimeSec / 60);
+
+  return {
+    hashrateKhs: khs,
+    accepted: acc,
+    rejected: rej,
+    accmn: parsed.ACCMN || (acc / minsRun).toFixed(2),
+    diff: parsed.DIFF || "-",
+    uptime: uptimeSec,
+    responding: true,
+  };
+}
+
 app.use(express.json());
 
 const CONFIG_FILE = "pi_pool_config.json";
@@ -106,33 +247,55 @@ function saveConfigToDisk() {
   }
 }
 
-// Helper to find available miner binary on system
-function findMinerBinary(): string | null {
-  const candidates = ["cpuminer-multi", "cpuminer-opt", "cpuminer", "xmrig", "ccminer", "minerd"];
+// Helper to find available miner binary on system for given miner program
+function findMinerBinaryForProgram(prog: 'cpuminer-multi' | 'duino-coin' | 'xmrig'): string | null {
+  const candidatesMap = {
+    'cpuminer-multi': ["cpuminer-multi", "cpuminer-opt", "cpuminer"],
+    'xmrig': ["xmrig", "xmrig-cuda"],
+    'duino-coin': ["duino-miner", "PC_Miner.py", "AVR_Miner.py"],
+  };
+
+  const candidates = candidatesMap[prog] || candidatesMap['cpuminer-multi'];
   for (const bin of candidates) {
     try {
       const out = execSync(`which ${bin}`, { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }).trim();
       if (out && fs.existsSync(out)) return out;
     } catch (e) {}
   }
-  // Check local build relative path
-  const localCandidates = [
-    "/home/jefe/cpuminer-multi/cpuminer",
-    "./cpuminer-multi",
-    "./cpuminer",
-    "./cpuminer-opt",
-    "./xmrig",
-    "/usr/local/bin/cpuminer-multi",
-    "/usr/bin/cpuminer-multi",
-    "/usr/local/bin/cpuminer",
-    "/usr/bin/cpuminer",
-    "/usr/local/bin/cpuminer-opt",
-    "/usr/bin/cpuminer-opt",
-  ];
-  for (const p of localCandidates) {
+
+  // Check local build relative paths
+  const localCandidatesMap = {
+    'cpuminer-multi': [
+      "/home/jefe/cpuminer-multi/cpuminer",
+      "./cpuminer-multi",
+      "./cpuminer",
+      "./cpuminer-opt",
+      "/usr/local/bin/cpuminer-multi",
+      "/usr/bin/cpuminer-multi",
+      "/usr/local/bin/cpuminer",
+      "/usr/bin/cpuminer",
+    ],
+    'xmrig': [
+      "/usr/local/bin/xmrig",
+      "/usr/bin/xmrig",
+      "./xmrig",
+    ],
+    'duino-coin': [
+      "./PC_Miner.py",
+      "./AVR_Miner.py",
+      "/usr/local/bin/duino-miner",
+    ],
+  };
+
+  const locals = localCandidatesMap[prog] || localCandidatesMap['cpuminer-multi'];
+  for (const p of locals) {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+function findMinerBinary(): string | null {
+  return findMinerBinaryForProgram('cpuminer-multi') || findMinerBinaryForProgram('xmrig') || findMinerBinaryForProgram('duino-coin');
 }
 
 // Helper to read real CPU temperature from Raspberry Pi kernel sysfs, vcgencmd, or hwmon
@@ -357,70 +520,69 @@ app.get("/api/miner/status", async (req, res) => {
       pool.cores.length > 0;
 
     const apiPort = getPoolApiPort(poolKey);
-    let summaryObj: Record<string, string> | null = null;
-    let threadsRaw: string | null = null;
+    let apiMetrics: {
+      hashrateKhs: number;
+      accepted: number;
+      rejected: number;
+      accmn: string;
+      diff: string;
+      uptime: number;
+      responding: boolean;
+    } | null = null;
 
     if (isPoolActive) {
-      const [sumRes, thrRes] = await Promise.all([
-        queryCpuminerApi(apiPort, "summary"),
-        queryCpuminerApi(apiPort, "threads"),
-      ]);
-      if (sumRes) summaryObj = parseApiKvPayload(sumRes);
-      threadsRaw = thrRes;
-    }
-
-    let poolHash = 0;
-    if (summaryObj && summaryObj.KHS) {
-      const parsedKhs = parseFloat(summaryObj.KHS);
-      if (!isNaN(parsedKhs) && parsedKhs > 0) {
-        poolHash = parsedKhs;
-        livePoolHashrates[poolKey] = parsedKhs;
-      }
-    } else if (threadsRaw) {
-      let sum = 0;
-      for (const m of threadsRaw.matchAll(/KHS=([0-9.]+)/gi)) {
-        const val = parseFloat(m[1]);
-        if (!isNaN(val)) sum += val;
-      }
-      if (sum > 0) {
-        poolHash = sum;
-        livePoolHashrates[poolKey] = sum;
-      }
-    }
-
-    if (poolHash === 0 && isPoolActive) {
-      poolHash = getPoolHashrateKhs(poolKey, pool);
-    }
-    if (isPoolActive) {
-      overallHashrateKhs += poolHash;
+      apiMetrics = await queryMinerApiForPool(poolKey, pool);
     }
 
     if (!sharesData[poolKey]) {
       sharesData[poolKey] = { acc: 0, rej: 0, lastShare: Date.now() };
     }
-    const shares = sharesData[poolKey];
-    if (summaryObj) {
-      if (summaryObj.ACC) {
-        const parsedAcc = parseInt(summaryObj.ACC, 10);
-        if (!isNaN(parsedAcc)) shares.acc = parsedAcc;
-      }
-      if (summaryObj.REJ) {
-        const parsedRej = parseInt(summaryObj.REJ, 10);
-        if (!isNaN(parsedRej)) shares.rej = parsedRej;
-      }
+
+    let poolHash = 0;
+    let accShares = 0;
+    let rejShares = 0;
+    let accmn = "0.00";
+    let difficulty = "-";
+    let poolUptime = uptimeSeconds;
+
+    if (apiMetrics) {
+      poolHash = apiMetrics.hashrateKhs;
+      accShares = apiMetrics.accepted;
+      rejShares = apiMetrics.rejected;
+      accmn = apiMetrics.accmn;
+      difficulty = apiMetrics.diff;
+      poolUptime = apiMetrics.uptime || uptimeSeconds;
+
+      // Keep sharesData in sync with authoritative miner API
+      sharesData[poolKey].acc = accShares;
+      sharesData[poolKey].rej = rejShares;
+      livePoolHashrates[poolKey] = poolHash;
+    } else if (isPoolActive) {
+      poolHash = getPoolHashrateKhs(poolKey, pool);
+      accShares = sharesData[poolKey].acc;
+      rejShares = sharesData[poolKey].rej;
+      const minsRun = Math.max(1, uptimeSeconds / 60);
+      accmn = (accShares / minsRun).toFixed(2);
+      difficulty = pool.algo === "duco-s1" ? "1,500" : "12,450.0";
     }
 
-    const minsRun = Math.max(1, uptimeSeconds / 60);
-    const accmn = summaryObj?.ACCMN || (isPoolActive ? (shares.acc / minsRun).toFixed(2) : "0.00");
-    const difficulty = summaryObj?.DIFF || (isPoolActive ? "12,450.0" : "-");
+    if (isPoolActive) {
+      overallHashrateKhs += poolHash;
+    }
 
     const fullUser = pool.worker ? `${pool.wallet}.${pool.worker}` : pool.wallet;
     const tasksetStr =
       pool.cores && pool.cores.length > 0
         ? `taskset --cpu-list ${pool.cores.sort().join(",")} `
         : "";
-    const commandString = `${tasksetStr}/home/jefe/cpuminer-multi/cpuminer -a ${
-      pool.algo || "sha256d"
+    
+    const prog = pool.minerProgram || (pool.algo === 'randomx' || pool.algo === 'ghostrider' ? 'xmrig' : pool.algo === 'duco-s1' || pool.algo === 'duco-avr' ? 'duino-coin' : 'cpuminer-multi');
+    let binaryName = "/home/jefe/cpuminer-multi/cpuminer";
+    if (prog === 'xmrig') binaryName = "xmrig";
+    if (prog === 'duino-coin') binaryName = "python3 PC_Miner.py";
+
+    const commandString = `${tasksetStr}${binaryName} -a ${
+      pool.algo || "scrypt"
     } -o stratum+tcp://${pool.addr}:${pool.port} -u ${fullUser} -p ${
       pool.pass || "x"
     } --api-bind 127.0.0.1:${apiPort} -t ${pool.cores?.length || 1}`;
@@ -429,8 +591,8 @@ app.get("/api/miner/status", async (req, res) => {
       poolKey,
       name: pool.name,
       hashrateKhs: Math.round(poolHash * 100) / 100,
-      acceptedShares: shares.acc,
-      rejectedShares: shares.rej,
+      acceptedShares: accShares,
+      rejectedShares: rejShares,
       acceptedPerMin: accmn,
       difficulty,
       status: !pool.enabled
@@ -440,7 +602,7 @@ app.get("/api/miner/status", async (req, res) => {
         : isMinerRunning
         ? "Waiting"
         : "Idle",
-      uptimeSeconds: summaryObj?.UPTIME ? parseInt(summaryObj.UPTIME, 10) : uptimeSeconds,
+      uptimeSeconds: poolUptime,
       commandString,
     };
   }
@@ -504,20 +666,7 @@ function stopNativeMinerProcesses() {
 function startNativeMinerProcesses() {
   stopNativeMinerProcesses();
 
-  const minerBin = findMinerBinary();
   const timestamp = () => new Date().toISOString().replace("T", " ").substring(0, 19);
-
-  if (!minerBin) {
-    logs.unshift({
-      id: Math.random().toString(36).substring(2, 9),
-      timestamp: timestamp(),
-      poolKey: "System",
-      poolName: "Pi-Pool Daemon",
-      type: "system",
-      message: `[NOTICE] cpuminer binary not found in system PATH. Ensure cpuminer-multi (or cpuminer-opt) is installed ('sudo apt-get install -y cpuminer-multi' or compiled in /usr/local/bin). Dashboard is active in monitoring mode.`,
-    });
-    return;
-  }
 
   logs.unshift({
     id: Math.random().toString(36).substring(2, 9),
@@ -525,11 +674,17 @@ function startNativeMinerProcesses() {
     poolKey: "System",
     poolName: "Pi-Pool Daemon",
     type: "system",
-    message: `[NATIVE] Spawning cpuminer process '${minerBin}' with taskset CPU affinity...`,
+    message: `[NATIVE] Starting miner instances for supported software (cpuminer-multi, Duino-Coin, XMRig) with CPU taskset affinity...`,
   });
 
   for (const [poolKey, pool] of Object.entries(poolsConfig)) {
     if (pool.enabled && pool.addr && pool.wallet && Array.isArray(pool.cores) && pool.cores.length > 0) {
+      const prog: 'cpuminer-multi' | 'duino-coin' | 'xmrig' =
+        pool.minerProgram ||
+        (pool.algo === 'randomx' || pool.algo === 'ghostrider' ? 'xmrig' : pool.algo === 'duco-s1' || pool.algo === 'duco-avr' ? 'duino-coin' : 'cpuminer-multi');
+
+      const bin = findMinerBinaryForProgram(prog);
+
       // Stratum URL & Port formatting
       let stratumUrl = pool.addr.trim();
       if (pool.port && pool.port.trim() && !stratumUrl.includes(`:${pool.port.trim()}`)) {
@@ -554,21 +709,57 @@ function startNativeMinerProcesses() {
       const algo = pool.algo || "scrypt";
       const apiPort = getPoolApiPort(poolKey);
 
-      // Build taskset execution args
-      const args = [
-        "-c", coreList,
-        minerBin,
-        "-a", algo,
-        "-o", stratumUrl,
-        "-u", userArg,
-        "-p", pass,
-        "--api-bind", `127.0.0.1:${apiPort}`,
-        "-t", threadCount.toString()
-      ];
+      // Build execution arguments per miner type
+      let args: string[] = [];
+      const binaryPath = bin || (prog === 'xmrig' ? 'xmrig' : prog === 'duino-coin' ? 'python3' : '/home/jefe/cpuminer-multi/cpuminer');
+
+      if (prog === 'xmrig') {
+        args = [
+          "-c", coreList,
+          binaryPath,
+          "-o", stratumUrl,
+          "-u", userArg,
+          "-p", pass,
+          "-a", algo,
+          "--http-host", "127.0.0.1",
+          "--http-port", apiPort.toString(),
+          "-t", threadCount.toString()
+        ];
+      } else if (prog === 'duino-coin') {
+        args = [
+          "-c", coreList,
+          binaryPath,
+          "./PC_Miner.py",
+          "--username", pool.wallet,
+          "--worker-name", pool.worker || "Pi5",
+          "--api-port", apiPort.toString()
+        ];
+      } else {
+        // cpuminer-multi default
+        args = [
+          "-c", coreList,
+          binaryPath,
+          "-a", algo,
+          "-o", stratumUrl,
+          "-u", userArg,
+          "-p", pass,
+          "--api-bind", `127.0.0.1:${apiPort}`,
+          "-t", threadCount.toString()
+        ];
+      }
 
       try {
         const child = spawn("taskset", args, { stdio: ["ignore", "pipe", "pipe"] });
         activeChildProcesses[poolKey] = child;
+
+        logs.unshift({
+          id: Math.random().toString(36).substring(2, 9),
+          timestamp: timestamp(),
+          poolKey,
+          poolName: pool.name,
+          type: "system",
+          message: `[${pool.name}] Taskset spawned ${prog} (${binaryPath}) on CPU core(s) [${coreList}], API port ${apiPort}`,
+        });
 
         const handleLogData = (data: Buffer) => {
           const lines = data.toString("utf-8").split("\n");
@@ -579,7 +770,7 @@ function startNativeMinerProcesses() {
             let logType: "info" | "accepted" | "rejected" | "stratum" | "error" = "info";
             const lower = cleanLine.toLowerCase();
 
-            // Extract live reported hash rate if stdout contains speed info (e.g. "1720.50 khash/s" or "1.72 MH/s")
+            // Extract live reported hash rate if stdout contains speed info
             const speedMatch = cleanLine.match(/([0-9.,]+)\s*(khash\/s|kh\/s|mhash\/s|mh\/s|hash\/s|h\/s)/i);
             if (speedMatch) {
               const val = parseFloat(speedMatch[1].replace(",", ""));
@@ -597,10 +788,8 @@ function startNativeMinerProcesses() {
 
             if (isAcceptedLine && !isRejectedLine) {
               logType = "accepted";
-              if (sharesData[poolKey]) sharesData[poolKey].acc++;
             } else if (isRejectedLine) {
               logType = "rejected";
-              if (sharesData[poolKey]) sharesData[poolKey].rej++;
             } else if (lower.includes("stratum") || lower.includes("submitting") || lower.includes("difficulty")) {
               logType = "stratum";
             } else if (lower.includes("error") || lower.includes("failed") || lower.includes("unknown algorithm")) {
