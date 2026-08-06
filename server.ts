@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import net from "net";
 import { execSync, spawn, ChildProcess } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
@@ -8,6 +9,64 @@ import { DEFAULT_POOL_CONFIGS } from "./src/data/coins.js";
 
 const app = express();
 const PORT = 3000;
+const API_BASE_PORT = 4068;
+
+function getPoolApiPort(poolKey: string): number {
+  const match = poolKey.match(/\d+/);
+  const idx = match ? parseInt(match[0], 10) : 1;
+  return API_BASE_PORT + (idx - 1);
+}
+
+function queryCpuminerApi(apiPort: number, command: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port: apiPort });
+    let data = "";
+    let finished = false;
+
+    socket.setTimeout(300);
+
+    socket.on("connect", () => {
+      socket.write(`${command}\n`);
+    });
+
+    socket.on("data", (chunk) => {
+      data += chunk.toString("utf-8");
+    });
+
+    const done = () => {
+      if (!finished) {
+        finished = true;
+        socket.destroy();
+        resolve(data.trim() || null);
+      }
+    };
+
+    socket.on("timeout", done);
+    socket.on("end", done);
+    socket.on("error", () => {
+      if (!finished) {
+        finished = true;
+        socket.destroy();
+        resolve(null);
+      }
+    });
+  });
+}
+
+function parseApiKvPayload(rawPayload: string | null): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  if (!rawPayload) return parsed;
+  const items = rawPayload.split(";");
+  for (const item of items) {
+    if (item.includes("=")) {
+      const [key, value] = item.split("=", 2);
+      if (key && value !== undefined) {
+        parsed[key.trim().toUpperCase()] = value.trim();
+      }
+    }
+  }
+  return parsed;
+}
 
 app.use(express.json());
 
@@ -58,6 +117,7 @@ function findMinerBinary(): string | null {
   }
   // Check local build relative path
   const localCandidates = [
+    "/home/jefe/cpuminer-multi/cpuminer",
     "./cpuminer-multi",
     "./cpuminer",
     "./cpuminer-opt",
@@ -158,6 +218,7 @@ setInterval(() => {
   const timeStr = now.toTimeString().split(" ")[0];
 
   let totalKhs = 0;
+  const isRealProcessRunning = Object.keys(activeChildProcesses).length > 0;
 
   if (isMinerRunning) {
     for (const [poolKey, pool] of Object.entries(poolsConfig)) {
@@ -165,9 +226,12 @@ setInterval(() => {
         const poolHash = getPoolHashrateKhs(poolKey, pool);
         totalKhs += poolHash;
 
-        // Share generation simulation
-        if (Math.random() < 0.25) {
-          const isAccepted = Math.random() > 0.02; // 98% acceptance
+        // Share generation simulation ONLY if native child processes are not running
+        if (!isRealProcessRunning && Math.random() < 0.25) {
+          const isAccepted = Math.random() > 0.002; // 99.8% realistic acceptance
+          if (!sharesData[poolKey]) {
+            sharesData[poolKey] = { acc: 0, rej: 0, lastShare: Date.now() };
+          }
           if (isAccepted) {
             sharesData[poolKey].acc += 1;
             if (logs.length < 200) {
@@ -276,7 +340,7 @@ app.post("/api/logs/clear", (req, res) => {
 });
 
 // Miner Status GET
-app.get("/api/miner/status", (req, res) => {
+app.get("/api/miner/status", async (req, res) => {
   const now = Date.now();
   const uptimeSeconds = isMinerRunning ? Math.floor((now - minerStartTime) / 1000) : 0;
 
@@ -292,15 +356,60 @@ app.get("/api/miner/status", (req, res) => {
       Array.isArray(pool.cores) &&
       pool.cores.length > 0;
 
-    let poolHash = 0;
+    const apiPort = getPoolApiPort(poolKey);
+    let summaryObj: Record<string, string> | null = null;
+    let threadsRaw: string | null = null;
+
     if (isPoolActive) {
+      const [sumRes, thrRes] = await Promise.all([
+        queryCpuminerApi(apiPort, "summary"),
+        queryCpuminerApi(apiPort, "threads"),
+      ]);
+      if (sumRes) summaryObj = parseApiKvPayload(sumRes);
+      threadsRaw = thrRes;
+    }
+
+    let poolHash = 0;
+    if (summaryObj && summaryObj.KHS) {
+      const parsedKhs = parseFloat(summaryObj.KHS);
+      if (!isNaN(parsedKhs) && parsedKhs > 0) {
+        poolHash = parsedKhs;
+        livePoolHashrates[poolKey] = parsedKhs;
+      }
+    } else if (threadsRaw) {
+      let sum = 0;
+      for (const m of threadsRaw.matchAll(/KHS=([0-9.]+)/gi)) {
+        const val = parseFloat(m[1]);
+        if (!isNaN(val)) sum += val;
+      }
+      if (sum > 0) {
+        poolHash = sum;
+        livePoolHashrates[poolKey] = sum;
+      }
+    }
+
+    if (poolHash === 0 && isPoolActive) {
       poolHash = getPoolHashrateKhs(poolKey, pool);
+    }
+    if (isPoolActive) {
       overallHashrateKhs += poolHash;
     }
 
     const shares = sharesData[poolKey] || { acc: 0, rej: 0 };
+    if (summaryObj) {
+      if (summaryObj.ACC) {
+        const parsedAcc = parseInt(summaryObj.ACC, 10);
+        if (!isNaN(parsedAcc)) shares.acc = parsedAcc;
+      }
+      if (summaryObj.REJ) {
+        const parsedRej = parseInt(summaryObj.REJ, 10);
+        if (!isNaN(parsedRej)) shares.rej = parsedRej;
+      }
+    }
+
     const minsRun = Math.max(1, uptimeSeconds / 60);
-    const accmn = isPoolActive ? (shares.acc / minsRun).toFixed(2) : "0.00";
+    const accmn = summaryObj?.ACCMN || (isPoolActive ? (shares.acc / minsRun).toFixed(2) : "0.00");
+    const difficulty = summaryObj?.DIFF || (isPoolActive ? "12,450.0" : "-");
 
     const fullUser = pool.worker ? `${pool.wallet}.${pool.worker}` : pool.wallet;
     const tasksetStr =
@@ -311,7 +420,7 @@ app.get("/api/miner/status", (req, res) => {
       pool.algo || "sha256d"
     } -o stratum+tcp://${pool.addr}:${pool.port} -u ${fullUser} -p ${
       pool.pass || "x"
-    } -t ${pool.cores?.length || 1}`;
+    } --api-bind 127.0.0.1:${apiPort} -t ${pool.cores?.length || 1}`;
 
     poolStatsMap[poolKey] = {
       poolKey,
@@ -320,7 +429,7 @@ app.get("/api/miner/status", (req, res) => {
       acceptedShares: shares.acc,
       rejectedShares: shares.rej,
       acceptedPerMin: accmn,
-      difficulty: isPoolActive ? "12,450.0" : "-",
+      difficulty,
       status: !pool.enabled
         ? "Disabled"
         : isPoolActive
@@ -328,7 +437,7 @@ app.get("/api/miner/status", (req, res) => {
         : isMinerRunning
         ? "Waiting"
         : "Idle",
-      uptimeSeconds,
+      uptimeSeconds: summaryObj?.UPTIME ? parseInt(summaryObj.UPTIME, 10) : uptimeSeconds,
       commandString,
     };
   }
@@ -440,6 +549,7 @@ function startNativeMinerProcesses() {
       const threadCount = pool.cores.length;
       const coreList = pool.cores.join(",");
       const algo = pool.algo || "scrypt";
+      const apiPort = getPoolApiPort(poolKey);
 
       // Build taskset execution args
       const args = [
@@ -449,6 +559,7 @@ function startNativeMinerProcesses() {
         "-o", stratumUrl,
         "-u", userArg,
         "-p", pass,
+        "--api-bind", `127.0.0.1:${apiPort}`,
         "-t", threadCount.toString()
       ];
 
@@ -478,10 +589,13 @@ function startNativeMinerProcesses() {
               }
             }
 
-            if (lower.includes("accept") || lower.includes("yes!") || lower.includes("share accepted") || lower.includes("yay!")) {
+            const isAcceptedLine = /accepted:\s*\d+|share accepted|\(yay!\)/i.test(cleanLine);
+            const isRejectedLine = /share rejected|\(boooo\)|reject:\s*\d+/i.test(cleanLine);
+
+            if (isAcceptedLine) {
               logType = "accepted";
               if (sharesData[poolKey]) sharesData[poolKey].acc++;
-            } else if (lower.includes("reject") || lower.includes("stale") || lower.includes("boooo")) {
+            } else if (isRejectedLine) {
               logType = "rejected";
               if (sharesData[poolKey]) sharesData[poolKey].rej++;
             } else if (lower.includes("stratum") || lower.includes("submitting") || lower.includes("difficulty")) {
@@ -552,6 +666,12 @@ app.post("/api/miner/start", (req, res) => {
 
   isMinerRunning = true;
   minerStartTime = Date.now();
+
+  // Reset shares tracking for clean new session
+  for (const key of Object.keys(poolsConfig)) {
+    sharesData[key] = { acc: 0, rej: 0, lastShare: Date.now() };
+    livePoolHashrates[key] = 0;
+  }
 
   logs.unshift({
     id: Math.random().toString(36).substring(2, 9),
